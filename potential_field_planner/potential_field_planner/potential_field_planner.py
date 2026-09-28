@@ -12,11 +12,42 @@ from tf_transformations import euler_from_quaternion
 
 class PotentialFieldPlanner(Node):
     """
-    Local planner for following the global path.
+    Local planner: attractive force toward the current waypoint,
+    repulsive force from obstacles seen in the live LaserScan.
 
-    Uses the laser scan to avoid nearby obstacles and publishes
-    velocity commands while moving through the received waypoints.
-    
+    Ported changes from the original simulation-only version:
+      - Works in the 'map' frame instead of 'odom' (so it doesn't drift
+        over long, multi-waypoint runs -- requires MCL/AMCL to be
+        publishing map -> odom).
+      - Follows a queue of waypoints received from the A* global planner
+        (/global_path) instead of one hardcoded goal.
+      - Only checks final orientation (goal_theta) on the LAST waypoint;
+        intermediate waypoints are passed through purely as position targets.
+      - Real-robot speed limits (RETUNE for your actual Robile unit).
+
+    Fixes applied for the "jerks then stalls before reaching the goal"
+    issue (local minimum in narrow corridors -- repulsive force from
+    nearby walls roughly cancelling the attractive force):
+      1. rho_0 (obstacle influence radius) lowered and made a tunable
+         parameter -- must be set smaller than half your corridor width,
+         otherwise the robot is ALWAYS within repulsion range of both
+         walls at once.
+      2. Repulsive force is smoothed over a short rolling window of scans,
+         instead of reacting to one raw noisy scan per tick -- this is
+         what was causing the visible jerking (obstacle points flickering
+         in/out of the rho_0 threshold frame-to-frame).
+      3. Rotate-in-place-first behaviour: if heading error to the desired
+         direction is large, stop translating and just rotate, instead of
+         trying to drive and turn simultaneously (this was the fix that
+         was in progress -- now applied and combined with the rest).
+      4. Stuck / local-minimum detection: if the net force magnitude stays
+         near zero for several ticks (attractive and repulsive force
+         cancelling out), inject a small escape nudge (rotate + creep)
+         to break the symmetry instead of just sitting there.
+      5. Attractive force is tapered down within a radius of the current
+         waypoint, so the robot decelerates smoothly instead of driving
+         at full commanded force right up to the tolerance boundary and
+         then snapping to a stop.
     """
 
     def __init__(self):
@@ -30,13 +61,36 @@ class PotentialFieldPlanner(Node):
 
         self.goal_tolerance = 0.15   # distance tolerance to advance to next waypoint
         self.goal_angle_tol = 0.1
-        # Start slowing down as the robot gets close to the waypoint.
-        # Keep this smaller than the spacing between waypoints so the robot
-        # has enough distance to reach normal cruising speed.
+        # Start decelerating within this distance of the waypoint. MUST be
+        # meaningfully smaller than astar_global_planner's waypoint_spacing_m
+        # (0.5m) -- if the taper zone is as large as the gap between waypoints,
+        # the robot is *always* inside it and can never accelerate to cruising
+        # speed for the whole path, only ever decelerating waypoint-to-waypoint
+        # (confirmed via force-magnitude logging: force_mag stayed ~0.18-0.24
+        # the entire inter-waypoint stretch instead of reaching ka=0.6, causing
+        # ~0.06 m/s crawl instead of anywhere near max_linear).
         self.taper_radius   = 0.2
 
-        # Rotate in place when the heading error is large.
+        # Heading error (radians) above which we stop translating and just rotate.
+        # ~0.6 rad = ~34 degrees, matches the in-progress fix from the last session.
+        # Hysteresis: enter rotate-only mode above rotate_first_threshold, but
+        # don't leave it again until the error drops below the lower
+        # rotate_first_exit threshold. Without this gap, a jittery heading
+        # estimate right at the threshold flips the robot between "rotate
+        # only" and "drive+turn" every control tick (10Hz) -- the robot
+        # never commits to a direction and just spins in place. This is
+        # what caused the stuck-spinning-near-a-pillar behaviour.
         self.rotate_first_threshold = 0.6
+        self.rotate_first_exit = 0.3
+        self._rotating_in_place = False
+
+        # Minimum obstacle distance used in the repulsive force calculation.
+        # The raw force scales with 1/d^2, which explodes for a very close
+        # obstacle point (e.g. skimming past a pillar) -- a tiny change in
+        # distance then swings the desired heading wildly from one tick to
+        # the next. Flooring d bounds the force so the heading target stays
+        # stable while still repelling strongly at close range.
+        self.min_obstacle_dist = 0.2
 
         # Stuck / local-minimum detection
         self.stuck_force_threshold = 0.15   # net force magnitude below this counts as "cancelling"
@@ -46,8 +100,10 @@ class PotentialFieldPlanner(Node):
         # Repulsive-force smoothing (rolling average over last N scans)
         self._rep_history = deque(maxlen=5)
 
-       # Conservative speed limits for the robot.
-       # These can be adjusted through ROS parameters.
+        # --- SAFETY: real-robot speed limits, much lower than the sim values.
+        # Overridable via ROS params (e.g. from a launch file) so the same
+        # node can be tuned per-platform without editing code. Defaults here
+        # are the conservative real-hardware values; raise them for sim.
         self.declare_parameter('max_linear', 0.15)
         self.declare_parameter('max_angular', 0.6)
         self.max_linear  = self.get_parameter('max_linear').value
@@ -55,7 +111,7 @@ class PotentialFieldPlanner(Node):
 
         self.planning_frame = 'map'   # change to 'odom' only if no localisation is running yet
 
-        self.waypoints     = deque()   # queue of waypoints
+        self.waypoints     = deque()   # queue of (x, y, is_final, theta_or_None)
         self.current_wp    = None
         self.latest_scan   = None
         self.goal_reached  = True      # true until a path is received
@@ -102,6 +158,7 @@ class PotentialFieldPlanner(Node):
         self.goal_reached = False
         self._stuck_counter = 0
         self._rep_history.clear()
+        self._rotating_in_place = False
         self.get_logger().info(f"New path received: {n} waypoints")
 
     # ------------------------------------------------------------------
@@ -159,12 +216,14 @@ class PotentialFieldPlanner(Node):
                 d  = math.hypot(rx, ry)
                 if d < 1e-6:
                     continue
+                d = max(d, self.min_obstacle_dist)
 
                 scale = self.kr * (1.0 / d - 1.0 / self.rho_0) / (d ** 2)
                 fx_rep_raw += scale * (rx / d)
                 fy_rep_raw += scale * (ry / d)
 
-        # Smooth the repulsive force to reduce laser noise.
+        # --- Smooth repulsion over a short rolling window to kill
+        #     frame-to-frame flicker from sensor noise near the rho_0 edge ---
         self._rep_history.append((fx_rep_raw, fy_rep_raw))
         fx_rep = sum(f[0] for f in self._rep_history) / len(self._rep_history)
         fy_rep = sum(f[1] for f in self._rep_history) / len(self._rep_history)
@@ -180,7 +239,9 @@ class PotentialFieldPlanner(Node):
 
     def control_loop(self):
         if self.goal_reached or self.current_wp is None:
-            # Stop once when idle instead of repeatedly publishing zero velocity.
+            # Stop once on going idle rather than streaming zeros at 10 Hz --
+            # an idle instance flooding /cmd_vel overrides any other publisher
+            # (e.g. a second planner instance left running from another launch).
             if not self._idle_stop_sent:
                 self.cmd_pub.publish(Twist())
                 self._idle_stop_sent = True
@@ -221,16 +282,35 @@ class PotentialFieldPlanner(Node):
                 self._stuck_counter = 0
 
             if self._stuck_counter >= self.stuck_ticks_to_trigger:
-                # Detect when the robot is stuck and apply a small recovery motion.
+                # Attractive and repulsive forces are cancelling -- break the
+                # symmetry with a small escape nudge rather than sitting still.
+                # Reset the counter immediately so this fires ONCE and then
+                # gives the next control_loop tick a chance to re-evaluate
+                # with the robot's new (nudged) orientation, instead of
+                # re-triggering on every subsequent tick forever -- which is
+                # what was causing the robot to spin in place continuously
+                # near a pillar (the counter never dropped back below
+                # stuck_ticks_to_trigger once it first crossed it).
+                self._stuck_counter = 0
                 self.get_logger().warn(
                     "Local minimum detected (force ~0) -- applying escape nudge")
                 cmd.angular.z = self.clamp(0.6, self.max_angular)
                 cmd.linear.x = 0.05
                 self.cmd_pub.publish(cmd)
                 return
-            
-            # Rotate in place when the heading error is large.
-            if abs(heading_error) > self.rotate_first_threshold:
+
+            # --- Rotate-in-place-first: don't drive and turn hard at the
+            #     same time when heading error is large. Hysteresis (enter
+            #     above rotate_first_threshold, exit only below
+            #     rotate_first_exit) stops a jittery heading estimate from
+            #     flip-flopping the robot between modes every tick. ---
+            if self._rotating_in_place:
+                still_rotating = abs(heading_error) > self.rotate_first_exit
+            else:
+                still_rotating = abs(heading_error) > self.rotate_first_threshold
+            self._rotating_in_place = still_rotating
+
+            if still_rotating:
                 cmd.linear.x = 0.0
                 cmd.angular.z = self.clamp(2.5 * heading_error, self.max_angular)
             else:

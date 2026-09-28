@@ -3,6 +3,7 @@ import math
 import heapq
 import numpy as np
 import tf2_ros
+from collections import deque
 
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSHistoryPolicy, QoSReliabilityPolicy
@@ -12,27 +13,35 @@ from geometry_msgs.msg import PoseStamped
 
 class AStarGlobalPlanner(Node):
     """
-    A* global planner for the robot.
+    Grid-based A* global planner.
 
-    Uses the map and robot pose to find a path to the received goal.
-    The resulting path is sent to the local planner as waypoints.
+    - Subscribes to the static map (/map, published by map_server / nav2_map_server)
+    - Subscribes to a goal (/goal_pose, e.g. published from RViz '2D Nav Goal',
+      or from your own goal-publishing script)
+    - Looks up the robot's current pose in the map frame via tf (map -> base_link)
+    - Runs A* over the inflated occupancy grid
+    - Publishes the resulting path as a pruned list of waypoints on /global_path
+      (nav_msgs/Path), which the potential field planner subscribes to.
     """
 
     def __init__(self):
         super().__init__('astar_global_planner')
-        self.get_logger().info("A* planner is ready")
+        self.get_logger().info("A* Global Planner Started")
 
         # --- Parameters you will likely want to tune ---
-        self.inflation_radius_m = 0.35   #  keep some distance from obstacles
-        self.occupied_thresh    = 50     # cells above this are occupied
-        self.waypoint_spacing_m = 0.5     # distance between output waypoints
+        self.inflation_radius_m = 0.35   # ~ robot radius + safety margin, in metres
+        self.occupied_thresh    = 50     # occupancy value >= this counts as occupied
+        self.waypoint_spacing_m = 0.5     # prune raw A* path to ~1 waypoint every N metres
 
         self.map_data   = None   # OccupancyGrid msg
         self.map_array  = None   # numpy 2D array, inflated
         self.map_info   = None
 
-       # /map is published with transient local QoS, so use the same settings here.
-
+        # nav2_map_server publishes /map once as a latched (TRANSIENT_LOCAL)
+        # topic and doesn't republish -- a VOLATILE subscriber (e.g. the
+        # default sensor-data QoS) only sees messages published after it
+        # connects, so it can permanently miss that one-shot publish if it
+        # loses the startup race. Match map_server's QoS instead.
         map_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
@@ -62,7 +71,8 @@ class AStarGlobalPlanner(Node):
             f"Map received: {width}x{height} @ {msg.info.resolution:.3f} m/cell")
 
     def inflate_obstacles(self, grid: np.ndarray) -> np.ndarray:
-        """Inflate obstacles so the planned path keeps some distance from them."""
+        """Dilate occupied cells by inflation_radius_m so A* keeps the robot
+        away from walls by roughly its own radius plus a safety margin."""
         resolution = self.map_info.resolution
         radius_cells = max(1, int(round(self.inflation_radius_m / resolution)))
 
@@ -119,7 +129,15 @@ class AStarGlobalPlanner(Node):
             return 0 <= c[0] < w and 0 <= c[1] < h
 
         def is_free(c):
-            return self.map_array[c[1], c[0]] < self.occupied_thresh
+            # OccupancyGrid cells are -1 for unknown (unmapped) space, not
+            # just 0-100 free-to-occupied. Checking only "< occupied_thresh"
+            # treats -1 as free too, since -1 < 50 -- so A* would happily
+            # plan straight-line shortcuts through unexplored territory
+            # outside the actual corridor (seen as the path looping outside
+            # the mapped area during real-robot exploration). Require the
+            # cell to be KNOWN free, not merely not-yet-known-occupied.
+            v = self.map_array[c[1], c[0]]
+            return 0 <= v < self.occupied_thresh
 
         def heuristic(a, b):
             return math.hypot(a[0] - b[0], a[1] - b[1])
@@ -174,7 +192,8 @@ class AStarGlobalPlanner(Node):
         return path
 
     def prune_path(self, world_path):
-        """" Reduce the number of waypoints sent to the local planner."""
+        """Keep the first, last, and points spaced roughly waypoint_spacing_m apart,
+        so the potential field planner doesn't get a waypoint every single cell."""
         if len(world_path) <= 2:
             return world_path
 
@@ -187,6 +206,44 @@ class AStarGlobalPlanner(Node):
         pruned.append(world_path[-1])
         return pruned
 
+    def is_free_cell(self, c):
+        v = self.map_array[c[1], c[0]]
+        return 0 <= v < self.occupied_thresh
+
+    def find_nearest_free_cell(self, start, max_radius=25):
+        """BFS outward from `start` for the nearest known-free cell.
+
+        Needed because blocking unknown (-1) cells in A* (so it can't cut
+        through unexplored territory) means a start cell that itself lands
+        on unknown ground -- e.g. the robot's own just-clamped edge
+        position, before SLAM has scanned under it yet -- has no free
+        neighbors to expand into, so search() fails immediately with "no
+        path found" even though the robot is standing on real, walkable
+        floor. Snapping to the nearest cell the map already knows is free
+        gives A* somewhere it can actually search from.
+        """
+        if self.is_free_cell(start):
+            return start
+        h, w = self.map_array.shape
+        visited = {start}
+        queue = deque([start])
+        neighbors = [(-1, -1), (-1, 0), (-1, 1),
+                     (0, -1),           (0, 1),
+                     (1, -1),  (1, 0),  (1, 1)]
+        while queue:
+            cur = queue.popleft()
+            if abs(cur[0] - start[0]) > max_radius or abs(cur[1] - start[1]) > max_radius:
+                continue
+            for dx, dy in neighbors:
+                nxt = (cur[0] + dx, cur[1] + dy)
+                if nxt in visited or not (0 <= nxt[0] < w and 0 <= nxt[1] < h):
+                    continue
+                visited.add(nxt)
+                if self.is_free_cell(nxt):
+                    return nxt
+                queue.append(nxt)
+        return None
+
     # ------------------------------------------------------------------
     # Goal callback: plan and publish
     # ------------------------------------------------------------------
@@ -196,8 +253,8 @@ class AStarGlobalPlanner(Node):
             self.get_logger().warn("No map received yet, ignoring goal")
             return
 
-        robot_position = self.get_robot_pose_in_map()
-        if robot_position is None:
+        robot_xy = self.get_robot_pose_in_map()
+        if robot_xy is None:
             return
 
         start_grid = self.world_to_grid(*robot_xy)
@@ -211,8 +268,18 @@ class AStarGlobalPlanner(Node):
         # of just "outside map bounds" -- saves a debugging round-trip.
         h, w = self.map_array.shape
         if not (0 <= start_grid[0] < w and 0 <= start_grid[1] < h):
-        # The robot can briefly be outside the current SLAM map.
-        # Clamp the start cell so planning can continue while the map grows.
+            # This genuinely happens during SLAM exploration (Part 3), not just
+            # a hypothetical: a forward-only-FOV laser mounted ahead of
+            # base_link means the very first map, built before the robot has
+            # moved at all, can end just short of covering the robot's own
+            # position. Erroring out here is fatal -- the robot never gets a
+            # path, never moves, the map never grows, and this never resolves
+            # on its own. Clamp the START to the nearest in-bounds cell instead
+            # (the goal is left untouched -- it always comes from a real cell
+            # already inside the map, e.g. a frontier, so it is never the
+            # problem). Planning from the clamped edge cell gets the robot
+            # moving in roughly the right direction, which lets slam_toolbox
+            # grow the map to actually include the robot within a cycle or two.
             clamped_start = (min(max(start_grid[0], 0), w - 1),
                               min(max(start_grid[1], 0), h - 1))
             self.get_logger().warn(
@@ -225,6 +292,18 @@ class AStarGlobalPlanner(Node):
                 f"-- likely the SLAM map hasn't grown to cover it yet. Clamping "
                 f"the A* start cell to {clamped_start} instead of aborting.")
             start_grid = clamped_start
+
+        if not self.is_free_cell(start_grid):
+            snapped = self.find_nearest_free_cell(start_grid)
+            if snapped is None:
+                self.get_logger().error(
+                    f"No known-free cell within range of start {start_grid} "
+                    f"-- can't plan yet, waiting for more of the map.")
+                return
+            self.get_logger().warn(
+                f"Start cell {start_grid} is unknown/unmapped, snapped to "
+                f"nearest known-free cell {snapped}.")
+            start_grid = snapped
 
         grid_path = self.astar(start_grid, goal_grid)
         if grid_path is None:
