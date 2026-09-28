@@ -37,3 +37,14 @@ Each ROS 2 package lives at the repo root:
 - **A* planning through unmapped space:** our first version of A* treated unexplored (`-1`) grid cells as freely traversable, so during exploration it would plan paths that cut straight through unmapped territory outside the actual corridor. Fixed by requiring cells to be *known*-free, and separately snapping the robot's start cell to the nearest known-free cell when it landed on not-yet-scanned ground (common right after the map first starts building).
 - **Potential field getting stuck at obstacles:** near round obstacles (pillars), the repulsive force's `1/d²` term made the desired heading jitter tick-to-tick, and a bug in our stuck/local-minimum recovery logic (the escape counter never reset after firing) caused the robot to spin in place indefinitely instead of recovering. Fixed with a distance floor on the repulsive force, hysteresis on the rotate-vs-drive mode switch, and resetting the stuck counter after each recovery nudge.
 - **Map noise from in-place rotation:** much of the map "ghosting"/doubled walls we saw during exploration traced back to the robot spinning in place near obstacles (see above) — scans captured mid-spin smear before `slam_toolbox`'s scan matcher can correct them, so fixing the spin issue substantially cleaned up map quality too.
+
+## Demonstration Videos
+
+Video demonstrations of the implemented project tasks are available at the following Google Drive link:
+
+**Google Drive:** [AMR Project Demonstration Videos](https://drive.google.com/drive/folders/1ORb-ZtdHn81ERA6mHZrPNz-kDWaB_uad?usp=drive_link)
+
+The videos include demonstrations of:
+- Task 1: Path and Motion Planning
+- Task 2: Monte Carlo Localisation
+- Task 3: Environment Exploration
