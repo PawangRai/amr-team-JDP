@@ -1,103 +1,39 @@
+## Repository Structure
 
-# AMR FINAL PROJECT
+Each ROS 2 package lives at the repo root:
 
+- `astar_global_planner/` — grid-based A* global planner (Task 1 & 3)
+- `potential_field_planner/` — local planner using attractive/repulsive forces to follow waypoints (Task 1 & 3)
+- `mcl_localization/` — custom Monte Carlo localisation / particle filter (Task 2)
+- `frontier_exploration/` — frontier-based exploration node (Task 3)
+- `robile_navigation_task1/` — Task 1 launch/config files (AMCL localisation against a static map)
+- `robile_navigation_task3/` — Task 3 launch/config files (live SLAM + exploration)
 
-## Important Information
+`robile_navigation_task1` and `robile_navigation_task3` are **not** standalone ROS packages — they're launch/config files meant to be merged into the [HBRS-AMR/robile_navigation](https://github.com/HBRS-AMR/robile_navigation) vendor package (config files into its `config/`, launch files into its `launch/`), since that package provides the base bringup infrastructure we build on top of.
 
-| Item | Details |
-|------|---------|
-| Assignment Release | 1 July 2026 |
-| Due Date | **28 September 2026, 23:59 CET** |
-| Repository Visibility | Public |
-| Team Size | 3–4 students |
-| Submission | Prepare a report with the format explained in class and Submit the GitHub repository URL on LEA |
+## How to Run
 
+1. Clone this repo's packages and the vendor `robile_navigation` package into your workspace's `src/`, then merge the `robile_navigation_task1`/`robile_navigation_task3` files into vendor `robile_navigation`'s `config/`/`launch/` folders.
+2. `colcon build --symlink-install`
+3. `source install/setup.bash`, and set `export ROS_DOMAIN_ID=<your robot's domain>` in every terminal (must match the robot — check with the robot's own hostname/config if unsure).
+4. On the robot: `ros2 launch robile_bringup robot.launch.py`
+5. On your machine:
+   - **Task 1:** `ros2 launch robile_navigation task1_real_robot.launch.py`
+   - **Task 2:** `ros2 launch mcl_localization task2_real_robot.launch.py`
+   - **Task 3:** `ros2 launch robile_navigation task3_exploration_real_robot.launch.py`
 
-# Getting Started
+## Our Approach
 
-## Step 1
+**Task 1 — Path and Motion Planning:** We used `nav2_amcl` for localisation against a pre-built map (`c_069_latest`), an A* planner over the inflated occupancy grid to produce a sparse sequence of waypoints to the goal, and a potential field planner as the local controller — attractive force toward the current waypoint, repulsive force from obstacles in the live laser scan, with the two force fields summed to produce the commanded velocity.
 
-Click **Use this template** (green button at the top of this page).
+**Task 2 — Localisation:** We implemented a Monte Carlo localisation (particle filter) from scratch, following the standard predict → weight (via laser scan likelihood) → resample cycle, and integrated it as a drop-in alternative to AMCL.
 
-## Step 2
+**Task 3 — Environment Exploration:** We paired `slam_toolbox` (online async mode, building the map live) with a frontier exploration node that continuously selects goal poses at the boundary between known and unknown space and feeds them to the same A* + potential field planning stack from Task 1, so the robot autonomously explores without a pre-built map.
 
-Create a new repository using the following naming convention:
+## Challenges Faced
 
-```
-amr-team-<team_name>
-```
-
-Replace '<team_name>' with your desired team name.
-
-## Step 3
-
-Set the repository visibility to **Public** and create the repository.
-
-## Step 4
-
-Invite your team members as collaborators to the repository.
-
-```
-Settings
-    ↓
-Collaborators
-    ↓
-Add people
-```
-
-## Step 5
-
-Clone your repository
-
-example:
-
-```bash
-git clone https://github.com/amr-team-<team_name>.git
-```
-
-## Finally
-
-Work collaboratively by splitting the tasks among team members and individually push your code to the repository.
-
-## Important Note
-
-- Team members work is evaluated based on your commit history, if  we do not see any commits from a team member then we cannot consider their contribution. 
-
-- You can use issue boards and other tools to create issues and pull requests to manage your work and better showcase collaboration.
-
-- Make sure you record almost every session because you need a working video to add into the report. Make sure to take screenshots, screenrecords etc to document your work in an effective manner.
-
-- The robots in the lab are prone to issues so finish everything on simulation as fast as you can and start testing as soon as you can, do not wait until the last moment.
-
-- Make sure to use only one branch to track all of your codes and also do not upload entire folders on to Github, use a gitignore and keep only required files on there.
-
-- Write a nice Readme file on how to use the codes and also explain your approach for the tasks and also any challenges you faced, Feel free to modify this file.
-
-- Ensure when leaving the lab you charge the robots for next team that is coming or if you are the last team unplug the robot, switch it off and then leave.
-
-- Feel free to post any issues you faced on LEA, always refer to the documentation when in confusion and retrace your steps.
----
-
-# AMR Project
-
-## Project Objectives
-
-The objective of this project is that you deploy some of the functionalities that were discussed during the course on a real robot platform. In particular, we want to have functionalities for path and motion planning, localisation, and environment exploration on the robot.
-
-We will particularly use the Robile platform during the project; you are already familiar with this robot from the simulation you have been using throughout the semester as well as from the few practical lab sessions that we have had.
-
-## Task Description
-
-The project consists of three parts that are building on each other: (i) path and motion planning, (ii) localisation, and (iii) environment exploration.
-
-### 1. Path and Motion Planning
-
-You have already implemented a *potential field planner* in one of your assignments. In this first part of the project, you need to port your implementation to the real robot and ensure that it is working as well as it was in the simulated environment so that you can navigate towards global goals while avoiding obstacles. Then, integrate your potential field planner with a global path planner, namely first use a path planner (e.g. A*) to find a rough global trajectory of waypoints that the robot can follow to reach a goal and then use the potential field planner to navigate between the waypoints. This will make your potential field planner applicable to large environments, where it can navigate given an environment map.
-
-### 2. Localisation
-
-In one of the course lectures, we discussed Monte Carlo localisation as a practical solution to the robot localisation problem in an existing map. In this second part of the project, your objective is to implement your very own particle filter that you then integrate on the Robile. You should implement the simple version of the filter that we discussed in the lecture; however, if you have time and interest, you are free to additionally explore extensions / improvements to the algorithm, for example in the form of the adaptive Monte Carlo approach that we mentioned in the lecture.
-
-### 3. Environment Exploration
-
-The final objective of the project is to incorporate an environment exploration functionality to the robot. This will have to be combined with a SLAM component, namely you will need your exploration component to select poses to explore and a SLAM component that will take care of actually creating a map. The exploration algorithm should ideally select poses at the map fringe (i.e. poses that are at the boundary between the explored and unexplored region), but you are free to explore different pose selection strategies in your implementation.
+- **TF frame mismatch on the real robot:** the vendor bringup swaps `base_link`↔`base_footprint` relative to simulation, so AMCL, `slam_toolbox`, and our planners all had to be reconfigured to use `base_link` as the robot's real-robot base frame instead of `base_footprint`.
+- **ROS_DOMAIN_ID mismatches:** the biggest real-robot blocker was simply a domain ID mismatch between our laptop and the robot — no sensor data arrived, which looked identical to a dead laser/driver until we diagnosed it directly.
+- **A* planning through unmapped space:** our first version of A* treated unexplored (`-1`) grid cells as freely traversable, so during exploration it would plan paths that cut straight through unmapped territory outside the actual corridor. Fixed by requiring cells to be *known*-free, and separately snapping the robot's start cell to the nearest known-free cell when it landed on not-yet-scanned ground (common right after the map first starts building).
+- **Potential field getting stuck at obstacles:** near round obstacles (pillars), the repulsive force's `1/d²` term made the desired heading jitter tick-to-tick, and a bug in our stuck/local-minimum recovery logic (the escape counter never reset after firing) caused the robot to spin in place indefinitely instead of recovering. Fixed with a distance floor on the repulsive force, hysteresis on the rotate-vs-drive mode switch, and resetting the stuck counter after each recovery nudge.
+- **Map noise from in-place rotation:** much of the map "ghosting"/doubled walls we saw during exploration traced back to the robot spinning in place near obstacles (see above) — scans captured mid-spin smear before `slam_toolbox`'s scan matcher can correct them, so fixing the spin issue substantially cleaned up map quality too.
